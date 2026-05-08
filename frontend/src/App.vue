@@ -1,17 +1,30 @@
 <script lang="ts" setup>
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { FolderOpened, Refresh, Search } from '@element-plus/icons-vue'
+import { DocumentCopy, FolderOpened, Refresh, Search } from '@element-plus/icons-vue'
 import { QueryGitLogs, ScanRepositories, SelectDirectory } from '../wailsjs/go/main/App'
 import { model } from '../wailsjs/go/models'
+import { ClipboardSetText } from '../wailsjs/runtime/runtime'
 import type { GitCommit, GitLogResponse, RepoError, RepoInfo } from './types/git'
-import { formatFiles, parseRepoNames } from './utils/formatter'
+import { parseRepoNames } from './utils/formatter'
+
+const SETTINGS_STORAGE_KEY = 'git-worklog-extractor:settings'
+
+interface PersistedSettings {
+  rootPath: string
+  excludeRepoText: string
+  maxDepth: number
+  dateRange: string[]
+  since?: string
+  until?: string
+  author: string
+  noMerges: boolean
+}
 
 const rootPath = ref('')
 const excludeRepoText = ref('')
 const maxDepth = ref(2)
-const since = ref('')
-const until = ref('')
+const dateRange = ref<[string, string] | []>([])
 const author = ref('')
 const noMerges = ref(true)
 const repos = ref<RepoInfo[]>([])
@@ -25,6 +38,70 @@ const selectedRepos = computed(() => {
   const selected = new Set(selectedRepoPaths.value)
   return repos.value.filter((repo) => selected.has(repo.path))
 })
+
+const selectedRepoSummary = computed(() => `${selectedRepos.value.length} / ${repos.value.length} 已选择`)
+
+const commitCopyText = computed(() => formatCommitForCopy(commits.value))
+
+function normalizeDateRange(value: unknown): [string, string] | [] {
+  if (!Array.isArray(value) || value.length < 2) {
+    return []
+  }
+
+  const start = typeof value[0] === 'string' ? value[0] : ''
+  const end = typeof value[1] === 'string' ? value[1] : ''
+  return start || end ? [start, end] : []
+}
+
+function normalizeSettings(settings: Partial<PersistedSettings>): PersistedSettings {
+  const nextMaxDepth = Number(settings.maxDepth)
+  const legacyDateRange = settings.since || settings.until ? [settings.since || '', settings.until || ''] : []
+
+  return {
+    rootPath: typeof settings.rootPath === 'string' ? settings.rootPath : '',
+    excludeRepoText: typeof settings.excludeRepoText === 'string' ? settings.excludeRepoText : '',
+    maxDepth: Number.isFinite(nextMaxDepth) ? nextMaxDepth : 2,
+    dateRange: Array.isArray(settings.dateRange) ? settings.dateRange : legacyDateRange,
+    author: typeof settings.author === 'string' ? settings.author : '',
+    noMerges: typeof settings.noMerges === 'boolean' ? settings.noMerges : true,
+  }
+}
+
+function loadSettings() {
+  try {
+    const rawSettings = localStorage.getItem(SETTINGS_STORAGE_KEY)
+    if (!rawSettings) {
+      return
+    }
+
+    const settings = normalizeSettings(JSON.parse(rawSettings) as Partial<PersistedSettings>)
+    rootPath.value = settings.rootPath
+    excludeRepoText.value = settings.excludeRepoText
+    maxDepth.value = settings.maxDepth
+    dateRange.value = normalizeDateRange(settings.dateRange)
+    author.value = settings.author
+    noMerges.value = settings.noMerges
+  } catch {
+    // Ignore invalid persisted settings so the app can still start normally.
+  }
+}
+
+function saveSettings() {
+  const settings: PersistedSettings = {
+    rootPath: rootPath.value,
+    excludeRepoText: excludeRepoText.value,
+    maxDepth: Number(maxDepth.value),
+    dateRange: [...dateRange.value],
+    author: author.value,
+    noMerges: Boolean(noMerges.value),
+  }
+
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings))
+  } catch {
+    // localStorage may be unavailable or full; this should not block normal usage.
+  }
+}
 
 async function handleSelectDirectory() {
   const path = await SelectDirectory()
@@ -64,13 +141,15 @@ async function handleQueryGitLogs() {
     return
   }
 
+  const [rangeSince, rangeUntil] = dateRange.value
+
   querying.value = true
   repoErrors.value = []
   try {
     const result = (await QueryGitLogs(model.GitLogRequest.createFrom({
       repos: selectedRepos.value,
-      since: since.value || '',
-      until: until.value ? `${until.value} 23:59:59` : '',
+      since: rangeSince || '',
+      until: rangeUntil ? `${rangeUntil} 23:59:59` : '',
       author: author.value.trim(),
       noMerges: noMerges.value,
     }))) as GitLogResponse
@@ -87,132 +166,250 @@ async function handleQueryGitLogs() {
     querying.value = false
   }
 }
+
+function handleSelectAllRepos() {
+  selectedRepoPaths.value = repos.value.map((repo) => repo.path)
+}
+
+function handleClearSelectedRepos() {
+  selectedRepoPaths.value = []
+}
+
+function formatCommitForCopy(commitList: GitCommit[]): string {
+  return commitList
+    .map((commit) => {
+      const files = commit.files.length > 0 ? commit.files.join('\n') : '无文件变更记录'
+
+      return [
+        `项目 [${commit.repoName}]`,
+        `提交时间: ${commit.commitTime}`,
+        `作者: ${commit.authorName}`,
+        `说明: ${commit.message}`,
+        '',
+        '变更文件:',
+        files,
+        '----------------------------------------',
+      ].join('\n')
+    })
+    .join('\n\n')
+}
+
+async function copyTextToClipboard(text: string) {
+  try {
+    await ClipboardSetText(text)
+    return true
+  } catch {}
+
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {}
+
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', 'true')
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch {
+    return false
+  }
+}
+
+async function handleCopyAllCommits() {
+  const text = commitCopyText.value.trim()
+  if (!text) {
+    ElMessage.warning('暂无可复制的提交记录')
+    return
+  }
+
+  const ok = await copyTextToClipboard(text)
+  if (ok) {
+    ElMessage.success('已复制提交记录文本')
+  } else {
+    ElMessage.error('复制失败，请手动选择文本复制')
+  }
+}
+
+onMounted(loadSettings)
+
+watch(
+  [rootPath, excludeRepoText, maxDepth, dateRange, author, noMerges],
+  saveSettings,
+)
 </script>
 
 <template>
   <main class="app-shell">
-    <section class="toolbar">
-      <div class="title-block">
-        <h1>Git Worklog Extractor</h1>
-        <span>扫描本地仓库并提取提交记录</span>
-      </div>
-      <el-button :icon="Refresh" :loading="scanning" type="primary" @click="handleScanRepositories">
-        扫描仓库
-      </el-button>
-    </section>
-
-    <section class="filter-panel">
-      <el-form label-position="top">
-        <div class="form-grid">
-          <el-form-item label="根目录">
-            <div class="path-row">
-              <el-input v-model="rootPath" placeholder="请选择或填写 Git 项目根目录" clearable />
-              <el-button :icon="FolderOpened" @click="handleSelectDirectory">选择目录</el-button>
-            </div>
-          </el-form-item>
-
-          <el-form-item label="扫描深度">
-            <el-input-number v-model="maxDepth" :min="0" :max="12" />
-          </el-form-item>
-
-          <el-form-item label="排除项目名称">
-            <el-input
-              v-model="excludeRepoText"
-              :autosize="{ minRows: 2, maxRows: 4 }"
-              placeholder="多个项目用逗号或换行分隔"
-              type="textarea"
-            />
-          </el-form-item>
-
-          <el-form-item label="作者">
-            <el-input v-model="author" placeholder="支持姓名或邮箱关键词" clearable />
-          </el-form-item>
-
-          <el-form-item label="开始时间">
-            <el-date-picker v-model="since" type="date" value-format="YYYY-MM-DD" placeholder="选择开始日期" />
-          </el-form-item>
-
-          <el-form-item label="结束时间">
-            <el-date-picker v-model="until" type="date" value-format="YYYY-MM-DD" placeholder="选择结束日期" />
-          </el-form-item>
+    <div class="main-layout">
+      <section class="toolbar glass-card">
+        <div class="title-block">
+          <h1>Git Worklog Extractor</h1>
+          <span>本地 Git 工作记录提取器</span>
         </div>
-        <div class="action-row">
-          <el-checkbox v-model="noMerges">排除 Merge 提交</el-checkbox>
+        <div class="toolbar-actions">
+          <el-button :icon="Refresh" :loading="scanning" type="primary" @click="handleScanRepositories">
+            扫描仓库
+          </el-button>
           <el-button :icon="Search" :loading="querying" type="success" @click="handleQueryGitLogs">
             获取提交记录
           </el-button>
         </div>
-      </el-form>
-    </section>
+      </section>
 
-    <section class="repo-section">
-      <div class="section-header">
-        <h2>仓库列表</h2>
-        <span>{{ selectedRepos.length }} / {{ repos.length }} 已选择</span>
-      </div>
-      <el-table
-        v-if="repos.length > 0"
-        :data="repos"
-        height="220"
-        row-key="path"
-      >
-        <el-table-column label="" width="48">
-          <template #default="{ row }">
-            <el-checkbox v-model="selectedRepoPaths" :label="row.path">
-              <span class="sr-only">选择仓库</span>
-            </el-checkbox>
-          </template>
-        </el-table-column>
-        <el-table-column prop="name" label="项目名" min-width="180" />
-        <el-table-column prop="path" label="路径" min-width="420" show-overflow-tooltip />
-      </el-table>
-      <el-empty v-else description="尚未扫描到仓库" />
-    </section>
+      <section class="filter-panel glass-card">
+        <el-form label-position="top">
+          <div class="filter-grid">
+            <el-form-item label="根目录" class="root-path-field">
+              <div class="path-row">
+                <el-input v-model="rootPath" placeholder="请选择或填写 Git 项目根目录" clearable />
+                <el-button :icon="FolderOpened" @click="handleSelectDirectory">选择目录</el-button>
+              </div>
+            </el-form-item>
 
-    <section v-if="repoErrors.length > 0" class="error-section">
-      <el-alert
-        v-for="error in repoErrors"
-        :key="`${error.repoPath}-${error.message}`"
-        :title="`${error.repoName || error.repoPath}：${error.message}`"
-        type="warning"
-        show-icon
-        :closable="false"
-      />
-    </section>
+            <el-form-item label="日期范围" class="date-range-field">
+              <el-date-picker
+                v-model="dateRange"
+                type="daterange"
+                value-format="YYYY-MM-DD"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+                range-separator="至"
+              />
+            </el-form-item>
 
-    <section class="commit-section">
-      <div class="section-header">
-        <h2>提交记录</h2>
-        <span>{{ commits.length }} 条</span>
-      </div>
-      <el-table :data="commits" height="360" stripe>
-        <el-table-column prop="repoName" label="项目名" width="180" show-overflow-tooltip />
-        <el-table-column prop="commitTime" label="提交时间" width="190" />
-        <el-table-column prop="authorName" label="作者" width="150" show-overflow-tooltip />
-        <el-table-column prop="message" label="提交说明" min-width="260" show-overflow-tooltip />
-        <el-table-column label="变更文件" min-width="320">
-          <template #default="{ row }">
-            <pre class="file-list">{{ formatFiles(row.files) }}</pre>
-          </template>
-        </el-table-column>
-      </el-table>
-    </section>
+            <el-form-item label="扫描深度" class="depth-field">
+              <el-input-number v-model="maxDepth" :min="0" :max="12" />
+            </el-form-item>
+
+            <el-form-item label="提交类型" class="merge-field">
+              <el-checkbox v-model="noMerges">排除 Merge 提交</el-checkbox>
+            </el-form-item>
+
+            <el-form-item label="排除项目名称" class="exclude-field">
+              <el-input
+                v-model="excludeRepoText"
+                placeholder="多个项目用逗号分隔"
+                clearable
+              />
+            </el-form-item>
+
+            <el-form-item label="作者" class="author-field">
+              <el-input v-model="author" placeholder="姓名或邮箱关键字" clearable />
+            </el-form-item>
+          </div>
+        </el-form>
+      </section>
+
+      <section v-if="repoErrors.length > 0" class="error-section glass-card">
+        <el-alert
+          v-for="error in repoErrors"
+          :key="`${error.repoPath}-${error.message}`"
+          :title="`${error.repoName || error.repoPath}: ${error.message}`"
+          type="warning"
+          show-icon
+          :closable="false"
+        />
+      </section>
+
+      <section class="content-grid">
+        <section class="repo-section glass-card">
+          <div class="section-header">
+            <div>
+              <h2>仓库列表</h2>
+              <span>{{ selectedRepoSummary }}</span>
+            </div>
+            <div class="section-actions">
+              <el-button size="small" @click="handleSelectAllRepos">全选</el-button>
+              <el-button size="small" @click="handleClearSelectedRepos">清空</el-button>
+            </div>
+          </div>
+
+          <el-table
+            v-if="repos.length > 0"
+            :data="repos"
+            class="repo-table"
+            height="100%"
+            row-key="path"
+          >
+            <el-table-column label="" width="46">
+              <template #default="{ row }">
+                <el-checkbox v-model="selectedRepoPaths" :label="row.path">
+                  <span class="sr-only">选择仓库</span>
+                </el-checkbox>
+              </template>
+            </el-table-column>
+            <el-table-column prop="name" label="项目名" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">
+                <el-tooltip :content="row.path" placement="top" effect="dark">
+                  <span class="repo-name">{{ row.name }}</span>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-else class="fill-empty" description="尚未扫描到仓库" />
+        </section>
+
+        <section class="commit-section glass-card">
+          <div class="section-header">
+            <div>
+              <h2>提交记录</h2>
+              <span>{{ commits.length }} 条</span>
+            </div>
+            <el-button :icon="DocumentCopy" size="small" type="primary" plain @click="handleCopyAllCommits">
+              复制当前列表文本
+            </el-button>
+          </div>
+
+          <div class="commit-preview">
+            <pre v-if="commitCopyText" class="commit-text">{{ commitCopyText }}</pre>
+            <el-empty v-else class="commit-empty" description="暂无提交记录，请先扫描并获取提交记录" />
+          </div>
+        </section>
+      </section>
+    </div>
   </main>
 </template>
 
 <style scoped>
 .app-shell {
-  min-height: 100vh;
-  padding: 24px;
+  height: 100vh;
+  overflow: hidden;
   box-sizing: border-box;
-  background: #f5f7fb;
+  background: linear-gradient(135deg, #f5f7fb 0%, #eef3f8 100%);
   color: #1f2937;
   text-align: left;
 }
 
+.main-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  padding: 18px 22px;
+  box-sizing: border-box;
+  gap: 14px;
+}
+
+.glass-card {
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+  backdrop-filter: blur(18px);
+}
+
 .toolbar,
+.toolbar-actions,
 .section-header,
-.action-row,
+.section-actions,
 .path-row {
   display: flex;
   align-items: center;
@@ -220,9 +417,13 @@ async function handleQueryGitLogs() {
 }
 
 .toolbar,
-.section-header,
-.action-row {
+.section-header {
   justify-content: space-between;
+}
+
+.toolbar {
+  flex: 0 0 auto;
+  padding: 16px 18px;
 }
 
 .title-block h1,
@@ -232,31 +433,93 @@ async function handleQueryGitLogs() {
 }
 
 .title-block h1 {
+  color: #111827;
   font-size: 24px;
+  font-weight: 700;
   line-height: 32px;
 }
 
 .title-block span,
 .section-header span {
-  color: #6b7280;
+  color: #64748b;
   font-size: 13px;
 }
 
-.filter-panel,
-.repo-section,
-.commit-section,
-.error-section {
-  margin-top: 16px;
-  padding: 16px;
-  border: 1px solid #dcdfe6;
-  border-radius: 8px;
-  background: #ffffff;
+.toolbar :deep(.el-button),
+.filter-panel :deep(.el-button),
+.section-actions :deep(.el-button),
+.commit-section :deep(.el-button) {
+  border-radius: 999px;
 }
 
-.form-grid {
+.filter-panel {
+  flex: 0 0 auto;
+  padding: 12px 16px 2px;
+}
+
+.filter-panel :deep(.el-form-item) {
+  margin-bottom: 10px;
+}
+
+.filter-panel :deep(.el-form-item__label) {
+  margin-bottom: 4px;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+}
+
+.filter-panel :deep(.el-date-editor.el-input),
+.filter-panel :deep(.el-date-editor.el-input__wrapper),
+.filter-panel :deep(.el-input-number) {
+  width: 100%;
+}
+
+.filter-panel :deep(.el-input__wrapper),
+.filter-panel :deep(.el-textarea__inner) {
+  border-radius: 12px;
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.28) inset;
+}
+
+.filter-grid {
   display: grid;
-  grid-template-columns: minmax(320px, 2fr) 160px minmax(240px, 1fr);
-  gap: 12px 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 1.35fr) 170px 118px 150px;
+  gap: 10px 14px;
+  align-items: end;
+}
+
+.root-path-field {
+  grid-column: span 2;
+}
+
+.date-range-field {
+  grid-column: span 1;
+}
+
+.exclude-field {
+  grid-column: span 3;
+}
+
+.author-field {
+  grid-column: span 2;
+}
+
+.depth-field,
+.merge-field {
+  grid-column: span 1;
+}
+
+.merge-field {
+  align-self: end;
+}
+
+.merge-field :deep(.el-form-item__content) {
+  min-height: 32px;
+  align-items: center;
+}
+
+.merge-field :deep(.el-checkbox) {
+  height: 32px;
 }
 
 .path-row {
@@ -264,23 +527,105 @@ async function handleQueryGitLogs() {
 }
 
 .path-row .el-input {
+  min-width: 0;
   flex: 1;
 }
 
 .error-section {
   display: grid;
+  flex: 0 0 auto;
   gap: 8px;
+  padding: 10px 14px;
 }
 
-.file-list {
-  max-height: 96px;
-  margin: 0;
+.content-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.32fr) minmax(560px, 0.68fr);
+  flex: 1;
+  min-height: 0;
+  gap: 16px;
+}
+
+.repo-section,
+.commit-section {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 16px;
+  box-sizing: border-box;
+  flex-direction: column;
+}
+
+.section-header {
+  flex: 0 0 auto;
+  margin-bottom: 12px;
+}
+
+.section-header > div:first-child {
+  min-width: 0;
+}
+
+.section-header h2 {
+  color: #111827;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 24px;
+}
+
+.repo-table {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.repo-table :deep(.el-table__inner-wrapper::before) {
+  display: none;
+}
+
+.repo-table :deep(.el-table__cell) {
+  padding: 7px 0;
+}
+
+.repo-table :deep(.el-table__body-wrapper) {
+  overflow-x: hidden;
+}
+
+.repo-name {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  color: #1f2937;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fill-empty,
+.commit-empty {
+  flex: 1;
+}
+
+.commit-preview {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
-  color: #374151;
-  font-family: Consolas, "Courier New", monospace;
-  font-size: 12px;
-  line-height: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.82);
+}
+
+.commit-text {
+  min-height: 100%;
+  margin: 0;
+  padding: 16px 18px;
+  box-sizing: border-box;
+  color: #1f2937;
+  font-family: Consolas, "SFMono-Regular", "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 22px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .sr-only {
@@ -295,16 +640,39 @@ async function handleQueryGitLogs() {
   border: 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 800px) {
+  .main-layout {
+    padding: 14px;
+  }
+
   .toolbar,
-  .action-row,
+  .toolbar-actions,
   .path-row {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .form-grid {
+  .filter-grid,
+  .content-grid {
     grid-template-columns: 1fr;
+  }
+
+  .root-path-field,
+  .date-range-field,
+  .exclude-field,
+  .author-field,
+  .depth-field,
+  .merge-field {
+    grid-column: auto;
+  }
+
+  .content-grid {
+    overflow: auto;
+  }
+
+  .repo-section,
+  .commit-section {
+    min-height: 360px;
   }
 }
 </style>
