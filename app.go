@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 
-	"git-worklog-extractor2/internal/model"
-	"git-worklog-extractor2/internal/service"
+	"git-worklog-extractor/internal/model"
+	"git-worklog-extractor/internal/service"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )

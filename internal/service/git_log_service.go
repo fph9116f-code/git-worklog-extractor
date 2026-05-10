@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"git-worklog-extractor2/internal/model"
+	"git-worklog-extractor/internal/model"
 )
 
 type GitLogService struct{}

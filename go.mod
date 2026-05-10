@@ -1,4 +1,4 @@
-module git-worklog-extractor2
+module git-worklog-extractor
 
 go 1.23.0
 
